@@ -65,11 +65,14 @@ def cas_select(unl_pos, pen_grid, m_inc):
     k, s = divmod(m_inc, r)
     picks = []
     for j in range(r):
-        avail = unl_pos.copy()
-        while len(picks) - j*k < k and avail.size:
-            p = mu[avail, j]; p = np.maximum(p, 1e-12); p /= p.sum()
+        avail = np.setdiff1d(unl_pos, picks)
+        while len(picks) - j * k < k and avail.size:
+            p = mu[avail, j]
+            p = np.maximum(p, 1e-12)
+            p /= p.sum()
             sel = np.random.choice(avail, 1, False, p)[0]
-            picks.append(sel); avail = avail[avail != sel]
+            picks.append(sel)
+            avail = avail[avail != sel]
     for t in range(s):
         avail = np.setdiff1d(unl_pos, picks)
         p = mu[avail, t]; p = np.maximum(p, 1e-12); p /= p.sum()
@@ -96,19 +99,21 @@ def train_round(net, data, train_idx, val_idx, opt, sched):
 
 # ───── one config (hidden, act) over 5 seeds ─────────────
 def run_setting(hidden, act_name, act_fn):
-    mse_mat  = np.zeros((len(SEEDS), ROUNDS + 1))
-    rank_mat = np.zeros((len(SEEDS), ROUNDS))
-    for s, seed in enumerate(SEEDS):
-        torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
+    cas_mses, cas_ranks, mc_mses = [], [], []
+    for seed in SEEDS:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
         # build graph & data
         G = nx.random_geometric_graph(N_NODES, 0.05)
         feats = np.random.rand(N_NODES, 5).astype(np.float32)
         labels = np.array([compute_label(f) for f in feats], dtype=np.float32)
         feats_scaled = feats
-        labels_scaled = StandardScaler().fit_transform(labels.reshape(-1,1))
+        labels_scaled = StandardScaler().fit_transform(labels.reshape(-1, 1))
         for i, f in enumerate(feats_scaled):
-            G.nodes[i]['x'] = f
-            G.nodes[i]['label'] = labels_scaled[i]
+            G.nodes[i]["x"] = f
+            G.nodes[i]["label"] = labels_scaled[i]
         data = from_networkx(G)
         data.x = torch.from_numpy(feats_scaled)
         data.y = torch.from_numpy(labels_scaled)
@@ -116,57 +121,78 @@ def run_setting(hidden, act_name, act_fn):
 
         # splits
         all_idx = np.arange(N_NODES)
-        test_idx = np.random.choice(all_idx, int(TEST_FRAC*N_NODES), replace=False)
+        test_idx = np.random.choice(all_idx, int(TEST_FRAC * N_NODES), replace=False)
         rem = np.setdiff1d(all_idx, test_idx)
         val_idx = np.random.choice(rem, VAL_COUNT, replace=False)
-        grid_idx = np.setdiff1d(rem, val_idx)           # |Z| = 2 500
+        grid_idx = np.setdiff1d(rem, val_idx)  # |Z| = 2 500
         lab_init = np.random.choice(grid_idx, M0, replace=False)
 
         for strategy in ("CAS", "MC"):
             labels = lab_init.copy()
-            unlab  = np.setdiff1d(grid_idx, labels)
+            unlab = np.setdiff1d(grid_idx, labels)
             net = GCN(5, hidden, 1, act_fn).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=0.01)
             sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                      opt, patience=3, factor=0.5, min_lr=1e-5)
+                opt, patience=3, factor=0.5, min_lr=1e-5
+            )
 
+            mses, ranks = [], []
             for r in range(ROUNDS + 1):
-                net = train_round(net, data,
-                                  torch.tensor(labels, device=device),
-                                  torch.tensor(val_idx, device=device),
-                                  opt, sch)
+                net = train_round(
+                    net,
+                    data,
+                    torch.tensor(labels, device=device),
+                    torch.tensor(val_idx, device=device),
+                    opt,
+                    sch,
+                )
                 mse = torch.nn.MSELoss()(
-                    net(data.x, data.edge_index)[0][torch.tensor(test_idx, device=device)],
-                    data.y[torch.tensor(test_idx, device=device)]).item()
-                if strategy == "CAS":
-                    mse_mat[s, r] = mse
-                    with open(LOG_FILE,"a") as f:
-                        f.write(f"{strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n")
-                # stop if last eval
-                if r == ROUNDS: break
+                    net(data.x, data.edge_index)[0][
+                        torch.tensor(test_idx, device=device)
+                    ],
+                    data.y[torch.tensor(test_idx, device=device)],
+                ).item()
+                mses.append(mse)
+                with open(LOG_FILE, "a") as f:
+                    f.write(
+                        f"{strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
+                    )
+                if r == ROUNDS:
+                    break
 
-                # ----- sampling
+                inc_now = min(INC, unlab.size)
+                if inc_now == 0:
+                    break
                 if strategy == "CAS":
                     with torch.no_grad():
                         pen = net(data.x, data.edge_index)[1]
                     pen_grid = pen[torch.tensor(grid_idx, device=device)].cpu().numpy()
                     unl_pos = np.searchsorted(grid_idx, unlab)
-                    inc_now = min(INC, unlab.size)
-                    if inc_now == 0: break
                     new_pos, rk = cas_select(unl_pos, pen_grid, inc_now)
                     new_ids = grid_idx[new_pos]
-                    rank_mat[s, r] = rk
-                else:   # MC
-                    inc_now = min(INC, unlab.size)
-                    if inc_now == 0: break
+                    ranks.append(rk)
+                else:  # MC
                     new_ids = np.random.choice(unlab, inc_now, replace=False)
 
                 labels = np.concatenate([labels, new_ids])
-                unlab  = np.setdiff1d(unlab, new_ids)
+                unlab = np.setdiff1d(unlab, new_ids)
 
-    mse_mean, mse_std = mse_mat.mean(0), mse_mat.std(0)
-    rank_mean, rank_std = rank_mat.mean(0), rank_mat.std(0)
-    return mse_mean, mse_std, rank_mean, rank_std
+            if strategy == "CAS":
+                cas_mses.append(mses)
+                cas_ranks.append(ranks)
+            else:
+                mc_mses.append(mses)
+
+    def _agg(arrs):
+        L = min(len(a) for a in arrs)
+        mat = np.array([a[:L] for a in arrs])
+        return mat.mean(0), mat.std(0)
+
+    cas_m_mean, cas_m_std = _agg(cas_mses)
+    mc_m_mean, mc_m_std = _agg(mc_mses)
+    cas_r_mean, cas_r_std = _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
+
+    return cas_m_mean, cas_m_std, cas_r_mean, cas_r_std, mc_m_mean, mc_m_std
 
 # ───── plot helper ────────────────────────────────────────
 def plot_group(depth, dct, ylabel, fname):
@@ -182,16 +208,26 @@ def plot_group(depth, dct, ylabel, fname):
     plt.legend(fontsize=7, ncol=3)
     plt.tight_layout(); plt.savefig(fname); plt.close()
 
-# ───── main sweep ────────────────────────────────────────
-for depth, width_list in WIDTHS.items():
-    mse_dict, rank_dict = {}, {}
-    for widths in width_list:
-        for act_name, act_fn in ACTS.items():
-            tag = f"{widths[-1]}_{act_name}" if depth==2 else f"{widths[1]}_{act_name}"
-            print(f"[{depth}-layer] {widths}  act={act_name}")
-            mse_m, mse_s, r_m, r_s = run_setting(widths, act_name, act_fn)
-            mse_dict[tag]  = (mse_m,  mse_s)
-            rank_dict[tag] = (r_m, r_s)
-    plot_group(depth, mse_dict,  "Test MSE",        f"mse_vs_samples_{depth}layer.png")
-    plot_group(depth, rank_dict, "Numerical rank r",f"rank_vs_samples_{depth}layer.png")
+
+if __name__ == "__main__":
+    for depth, width_list in WIDTHS.items():
+        mse_dict, rank_dict = {}, {}
+        for widths in width_list:
+            for act_name, act_fn in ACTS.items():
+                tag = (
+                    f"{widths[-1]}_{act_name}" if depth == 2 else f"{widths[1]}_{act_name}"
+                )
+                print(f"[{depth}-layer] {widths}  act={act_name}")
+                cas_m, cas_s, r_m, r_s, mc_m, mc_s = run_setting(
+                    widths, act_name, act_fn
+                )
+                mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
+                mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
+                rank_dict[f"{tag}_CAS"] = (r_m, r_s)
+        plot_group(
+            depth, mse_dict, "Test MSE", f"mse_vs_samples_{depth}layer.png"
+        )
+        plot_group(
+            depth, rank_dict, "Numerical rank r", f"rank_vs_samples_{depth}layer.png"
+        )
 
