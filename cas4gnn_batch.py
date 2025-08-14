@@ -1,11 +1,18 @@
 #!/usr/bin/env python
 # cas4gnn_batch.py  –  synthetic regression with CAS vs MC
 # --------------------------------------------------------
-import os, random, numpy as np, torch, matplotlib.pyplot as plt
-import networkx as nx, scipy.linalg as sla
+import os
+import random
+from typing import Iterable
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import scipy.linalg as sla
+import torch
 from sklearn.preprocessing import StandardScaler
-from torch_geometric.utils import from_networkx
 from torch_geometric.nn import GCNConv
+from torch_geometric.utils import from_networkx
 
 # ───── experiment grid ────────────────────────────────────
 DEPTH2 = [[8, 8], [16, 16], [32, 32]]
@@ -13,29 +20,48 @@ DEPTH3 = [[8, 16, 8], [16, 32, 16], [32, 64, 32]]
 DEPTH4 = [[8, 16, 16, 8], [16, 32, 32, 16], [32, 64, 64, 32]]
 WIDTHS = {2: DEPTH2, 3: DEPTH3, 4: DEPTH4}
 
-ACTS = {
-    "relu": torch.relu,
-    "tanh": torch.tanh,
-    "elu" : torch.nn.functional.elu
-}
+ACTS = {"relu": torch.relu, "tanh": torch.tanh, "elu": torch.nn.functional.elu}
 
-SEEDS        = range(5)
-N_NODES      = 10_000
-TEST_FRAC    = 0.70
-VAL_COUNT    = 500          # Option A
-M0, INC      = 500, 500
-ROUNDS       = 5            # 500 → 3 000 labels
-EPS_RANK     = 1e-6
-device       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SEEDS = range(5)
+N_NODES = 10_000
+TEST_FRAC = 0.70
+VAL_COUNT = 500  # Option A
+M0, INC = 500, 500
+ROUNDS = 5  # 500 → 3 000 labels
+EPS_RANK = 1e-6
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-LOG_FILE     = "Experiment.log"
+LOG_FILE = "Experiment.log"
 if os.path.exists(LOG_FILE):
     os.remove(LOG_FILE)
 
+
 # ───── label function ────────────────────────────────────
 def compute_label(f):
-    return (2*f[0] + 3*f[1] + 4*f[2] +
-            5*f[3] + 6*f[4] + np.sin(f[0]*f[4]))
+    return 2 * f[0] + 3 * f[1] + 4 * f[2] + 5 * f[3] + 6 * f[4] + np.sin(f[0] * f[4])
+
+
+def scale_labels(labels: np.ndarray, train_idx: Iterable[int]) -> np.ndarray:
+    """Scale labels using only training indices.
+
+    Parameters
+    ----------
+    labels:
+        Raw label array of shape ``(n,)``.
+    train_idx:
+        Indices used to fit the ``StandardScaler``.
+
+    Returns
+    -------
+    np.ndarray
+        Scaled labels cast to ``np.float32``.
+    """
+
+    scaler = StandardScaler()
+    scaler.fit(labels[np.array(list(train_idx))].reshape(-1, 1))
+    scaled = scaler.transform(labels.reshape(-1, 1)).astype(np.float32)
+    return scaled.squeeze()
+
 
 # ───── GCN (last layer linear) ───────────────────────────
 class GCN(torch.nn.Module):
@@ -44,7 +70,8 @@ class GCN(torch.nn.Module):
         self.act = act
         dims = [in_dim] + hidden
         self.convs = torch.nn.ModuleList(
-            GCNConv(dims[i], dims[i+1]) for i in range(len(hidden)))
+            GCNConv(dims[i], dims[i + 1]) for i in range(len(hidden))
+        )
         self.out_conv = GCNConv(dims[-1], out_dim)
 
     def forward(self, x, edge_index):
@@ -54,6 +81,7 @@ class GCN(torch.nn.Module):
         x = self.out_conv(x, edge_index)
         return x, pen
 
+
 # ───── CAS selection (dup‑free, rank‑0 fallback) ─────────
 def cas_select(unl_pos, pen_grid, m_inc):
     K, _ = pen_grid.shape
@@ -61,7 +89,7 @@ def cas_select(unl_pos, pen_grid, m_inc):
     if S[0] <= EPS_RANK:
         return np.random.choice(unl_pos, m_inc, replace=False), 0
     r = int(np.sum(S / S[0] > EPS_RANK))
-    mu = np.abs(U[:, :r])**2
+    mu = np.abs(U[:, :r]) ** 2
     k, s = divmod(m_inc, r)
     picks = []
     for j in range(r):
@@ -75,27 +103,40 @@ def cas_select(unl_pos, pen_grid, m_inc):
             avail = avail[avail != sel]
     for t in range(s):
         avail = np.setdiff1d(unl_pos, picks)
-        p = mu[avail, t]; p = np.maximum(p, 1e-12); p /= p.sum()
+        p = mu[avail, t]
+        p = np.maximum(p, 1e-12)
+        p /= p.sum()
         picks.append(np.random.choice(avail, 1, False, p)[0])
     return np.array(picks, dtype=int), r
 
-# ───── training routine (50 000 max epochs) ──────────────
+
+# ───── training routine (10 000 max epochs) ─────────────
 def train_round(net, data, train_idx, val_idx, opt, sched):
     crit = torch.nn.MSELoss()
-    best, patience = 1e9, 3; stagnant = 0
-    for ep in range(50_000):
-        net.train(); opt.zero_grad()
+    best, patience = 1e9, 3
+    stagnant = 0
+    for ep in range(10_000):
+        net.train()
+        opt.zero_grad()
         pred, _ = net(data.x, data.edge_index)
-        loss = crit(pred[train_idx], data.y[train_idx]); loss.backward(); opt.step()
-        if (ep+1) % 5_000 == 0 or ep == 0:
+        loss = crit(pred[train_idx], data.y[train_idx])
+        loss.backward()
+        opt.step()
+        if (ep + 1) % 1_000 == 0 or ep == 0:
             net.eval()
             with torch.no_grad():
-                v = crit(net(data.x, data.edge_index)[0][val_idx], data.y[val_idx]).item()
+                v = crit(
+                    net(data.x, data.edge_index)[0][val_idx], data.y[val_idx]
+                ).item()
             sched.step(v)
-            if v < best - 1e-6: best, stagnant = v, 0
-            else: stagnant += 1
-            if stagnant >= patience: break
+            if v < best - 1e-6:
+                best, stagnant = v, 0
+            else:
+                stagnant += 1
+            if stagnant >= patience:
+                break
     return net
+
 
 # ───── one config (hidden, act) over 5 seeds ─────────────
 def run_setting(hidden, act_name, act_fn):
@@ -105,19 +146,10 @@ def run_setting(hidden, act_name, act_fn):
         np.random.seed(seed)
         random.seed(seed)
 
-        # build graph & data
+        # build graph & raw data
         G = nx.random_geometric_graph(N_NODES, 0.05)
         feats = np.random.rand(N_NODES, 5).astype(np.float32)
         labels = np.array([compute_label(f) for f in feats], dtype=np.float32)
-        feats_scaled = feats
-        labels_scaled = StandardScaler().fit_transform(labels.reshape(-1, 1))
-        for i, f in enumerate(feats_scaled):
-            G.nodes[i]["x"] = f
-            G.nodes[i]["label"] = labels_scaled[i]
-        data = from_networkx(G)
-        data.x = torch.from_numpy(feats_scaled)
-        data.y = torch.from_numpy(labels_scaled)
-        data = data.to(device)
 
         # splits
         all_idx = np.arange(N_NODES)
@@ -126,6 +158,15 @@ def run_setting(hidden, act_name, act_fn):
         val_idx = np.random.choice(rem, VAL_COUNT, replace=False)
         grid_idx = np.setdiff1d(rem, val_idx)  # |Z| = 2 500
         lab_init = np.random.choice(grid_idx, M0, replace=False)
+
+        labels_scaled = scale_labels(labels, grid_idx)
+        for i, f in enumerate(feats):
+            G.nodes[i]["x"] = f
+            G.nodes[i]["label"] = labels_scaled[i]
+        data = from_networkx(G)
+        data.x = torch.from_numpy(feats)
+        data.y = torch.from_numpy(labels_scaled).to(torch.float32)
+        data = data.to(device)
 
         for strategy in ("CAS", "MC"):
             labels = lab_init.copy()
@@ -190,23 +231,33 @@ def run_setting(hidden, act_name, act_fn):
 
     cas_m_mean, cas_m_std = _agg(cas_mses)
     mc_m_mean, mc_m_std = _agg(mc_mses)
-    cas_r_mean, cas_r_std = _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
+    cas_r_mean, cas_r_std = (
+        _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
+    )
 
     return cas_m_mean, cas_m_std, cas_r_mean, cas_r_std, mc_m_mean, mc_m_std
 
+
 # ───── plot helper ────────────────────────────────────────
 def plot_group(depth, dct, ylabel, fname):
-    plt.figure(figsize=(6,4))
+    plt.figure(figsize=(6, 4))
     for lab, (m, s) in dct.items():
-        x = np.arange(len(m))*INC + M0
+        x = np.arange(len(m)) * INC + M0
+        lower = m - s
+        if ylabel == "Test MSE":
+            lower = np.clip(lower, 1e-12, None)
         plt.plot(x, m, label=lab, lw=2)
-        plt.fill_between(x, m-s, m+s, alpha=0.25)
-    if ylabel == "Test MSE": plt.yscale('log')
-    plt.xlabel("Labeled samples"); plt.ylabel(ylabel)
+        plt.fill_between(x, lower, m + s, alpha=0.25)
+    if ylabel == "Test MSE":
+        plt.yscale("log")
+    plt.xlabel("Labeled samples")
+    plt.ylabel(ylabel)
     plt.title(f"{ylabel} – {depth}-layer GCNs")
-    plt.grid(True, linestyle=':')
+    plt.grid(True, linestyle=":")
     plt.legend(fontsize=7, ncol=3)
-    plt.tight_layout(); plt.savefig(fname); plt.close()
+    plt.tight_layout()
+    plt.savefig(fname)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -215,7 +266,9 @@ if __name__ == "__main__":
         for widths in width_list:
             for act_name, act_fn in ACTS.items():
                 tag = (
-                    f"{widths[-1]}_{act_name}" if depth == 2 else f"{widths[1]}_{act_name}"
+                    f"{widths[-1]}_{act_name}"
+                    if depth == 2
+                    else f"{widths[1]}_{act_name}"
                 )
                 print(f"[{depth}-layer] {widths}  act={act_name}")
                 cas_m, cas_s, r_m, r_s, mc_m, mc_s = run_setting(
@@ -224,10 +277,7 @@ if __name__ == "__main__":
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
                 mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
                 rank_dict[f"{tag}_CAS"] = (r_m, r_s)
-        plot_group(
-            depth, mse_dict, "Test MSE", f"mse_vs_samples_{depth}layer.png"
-        )
+        plot_group(depth, mse_dict, "Test MSE", f"mse_vs_samples_{depth}layer.png")
         plot_group(
             depth, rank_dict, "Numerical rank r", f"rank_vs_samples_{depth}layer.png"
         )
-
