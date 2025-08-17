@@ -139,13 +139,13 @@ def train_round(net, data, train_idx, val_idx, opt, sched):
         loss = crit(pred[train_idx], data.y[train_idx])
         loss.backward()
         opt.step()
+        sched.step()
         if (ep + 1) % 5_000 == 0 or ep == 0:
             net.eval()
             with torch.no_grad():
                 v = crit(
                     net(data.x, data.edge_index)[0][val_idx], data.y[val_idx]
                 ).item()
-            sched.step(v)
             if v < best - 1e-6:
                 best, stagnant = v, 0
             else:
@@ -194,9 +194,8 @@ def run_setting(hidden, act_name, act_fn):
             unlab = np.setdiff1d(grid_idx, labels)
             net = GCN(5, hidden, 1, act_fn).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=0.01)
-            sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                opt, patience=3, factor=0.5, min_lr=1e-5
-            )
+            # simple exponential learning-rate decay
+            sch = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.99)
 
             mses, ranks = [], []
             for r in range(ROUNDS + 1):
