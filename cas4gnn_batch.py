@@ -163,19 +163,11 @@ def run_setting(hidden, act_name, act_fn):
         np.random.seed(seed)
         random.seed(seed)
 
-        # build graph & data
+        # build graph & labels
         G = nx.random_geometric_graph(N_NODES, 0.05)
         feats = np.random.rand(N_NODES, 5).astype(np.float32)
-        labels = np.array([compute_label(f) for f in feats], dtype=np.float32)
+        raw_labels = np.array([compute_label(f) for f in feats], dtype=np.float32)
         feats_scaled = feats
-        labels_scaled = StandardScaler().fit_transform(labels.reshape(-1, 1))
-        for i, f in enumerate(feats_scaled):
-            G.nodes[i]["x"] = f
-            G.nodes[i]["label"] = labels_scaled[i]
-        data = from_networkx(G)
-        data.x = torch.from_numpy(feats_scaled)
-        data.y = torch.from_numpy(labels_scaled)
-        data = data.to(device)
 
         # splits
         all_idx = np.arange(N_NODES)
@@ -184,6 +176,18 @@ def run_setting(hidden, act_name, act_fn):
         val_idx = np.random.choice(rem, VAL_COUNT, replace=False)
         grid_idx = np.setdiff1d(rem, val_idx)  # |Z| = 2 500
         lab_init = np.random.choice(grid_idx, M0, replace=False)
+
+        # fit scaler on training labels only, then transform full label set
+        scaler = StandardScaler().fit(raw_labels[lab_init].reshape(-1, 1))
+        labels_scaled = scaler.transform(raw_labels.reshape(-1, 1))
+
+        for i, f in enumerate(feats_scaled):
+            G.nodes[i]["x"] = f
+            G.nodes[i]["label"] = labels_scaled[i]
+        data = from_networkx(G)
+        data.x = torch.from_numpy(feats_scaled)
+        data.y = torch.from_numpy(labels_scaled)
+        data = data.to(device)
 
         for strategy in ("CAS", "MC"):
             labels = lab_init.copy()
