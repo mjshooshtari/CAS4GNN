@@ -167,9 +167,8 @@ if __name__ == "__main__":
                         k: torch.optim.Adam(nets[k].parameters(), lr=0.01) for k in nets
                     }
                     scheds = {
-                        k: torch.optim.lr_scheduler.ReduceLROnPlateau(
-                            opts[k], patience=10, factor=0.5, min_lr=1e-5
-                        )
+                        # decay learning rate exponentially each round
+                        k: torch.optim.lr_scheduler.ExponentialLR(opts[k], gamma=0.99)
                         for k in nets
                     }
                     ce = torch.nn.CrossEntropyLoss()
@@ -186,6 +185,7 @@ if __name__ == "__main__":
                             )
                             loss.backward()
                             opt.step()
+                            sch.step()
                             with torch.no_grad():
                                 val_logits, _ = net(data.x, data.edge_index)
                                 val_logits = val_logits[
@@ -196,8 +196,7 @@ if __name__ == "__main__":
                                     val_pred,
                                     data.y[torch.tensor(val_idx, device=device)],
                                 )
-                                sch.step(-val_acc)
-                            lr_now = sch.optimizer.param_groups[0]["lr"]
+                            lr_now = sch.get_last_lr()[0]
                             print(
                                 f"[{label}_{k}_s{seed}_r{r}] TrainLoss {loss.item():.4f}  ValAcc {val_acc:.4f}  LR {lr_now:.5f}"
                             )

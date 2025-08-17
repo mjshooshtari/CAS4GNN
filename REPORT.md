@@ -35,7 +35,7 @@
 - **Strict mismatch:** `StandardScaler` fit on all labels before splitting, causing data leakage and violating “train-only” fitting requirement【F:cas4gnn_batch.py†L170-L177】
 - **Strict mismatch:** Tests could not run; environment lacks PyTorch (dependency failure)【076b76†L1-L17】
 - **Behaviorally equivalent:** Rank-0 case falls back to uniform random sampling【F:cas4gnn_batch.py†L106-L107】
-- **Note:** Scheduler uses `ReduceLROnPlateau`; future work plans to switch to `ExponentialDecay`【F:cas4gnn_batch.py†L192-L195】
+- **Note:** Scheduler now uses `ExponentialLR` for exponential decay【F:cas4gnn_batch.py†L197-L198】
 
 ## CAS Instrumentation Checks
 - **Uniqueness:** Manual probe shows selections are globally unique within an increment【cc3f6c†L1-L5】
@@ -43,7 +43,7 @@
 - **Measure construction:** `μ=|U|²` built over grid `Z`; sampling restricts to unlabeled indices via `avail` set difference【F:cas4gnn_batch.py†L109-L126】
 - **k/s logic:** `divmod(m_inc, r)` yields `k` and `s`; manual probe confirmed `k=1`, `s=2` for `m_inc=5`, `r=3`【F:cas4gnn_batch.py†L110】,【cc3f6c†L5-L5】
 - **Scaler:** Fit on all labels (see mismatch above).
-- **Scheduler:** Current `ReduceLROnPlateau`; flag for future change.
+- **Scheduler:** Uses exponential decay via `ExponentialLR`.
 
 ## Tests / Probes
 - **Manual CAS probe:** `rank=3`, measures sum to 1, `k=1`, `s=2`, selections unique【cc3f6c†L1-L5】
@@ -52,6 +52,6 @@
 ## Recommendations
 1. Fit `StandardScaler` using only training labels; transform validation and test sets with the trained scaler.
 2. Ensure PyTorch and PyG are installable in CI to run tests.
-3. Replace `ReduceLROnPlateau` with `ExponentialDecay` scheduler in future updates.
+ 3. Adopt `ExponentialLR` for learning-rate decay.
 4. After dependencies are available, run and expand unit tests (`test_cas_alg_equivalence.py`, `test_cas_uniqueness.py`).
 
