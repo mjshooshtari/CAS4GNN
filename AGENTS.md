@@ -50,3 +50,11 @@ Smoke profile:
 - Cora: `m0=20`, `inc=20`, `rounds=1`, depths `[2]`, acts `['relu']`, seed `0`
 
 Outputs and filenames remain unchanged for default runs (figures + `Experiment.log`).
+
+## How to Run (MLP)
+
+```bash
+python cas4dl_batch.py --smoke --depths 2 --acts relu --seed 0 --cpu
+```
+
+CAS math mirrors the GNN version; embeddings are taken from the MLP's penultimate layer.
