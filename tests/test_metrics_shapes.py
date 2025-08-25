@@ -5,8 +5,8 @@ sys.path.append(str(pathlib.Path(__file__).resolve().parents[1]))
 import cas4gnn_batch as c4g
 
 
-def dummy_train_round(net, data, train_idx, val_idx, opt, sched):
-    return net
+def dummy_train_round(net, data, train_idx, val_idx, **kwargs):
+    return net, [], [], []
 
 
 def test_metrics_shapes(monkeypatch):
@@ -20,7 +20,7 @@ def test_metrics_shapes(monkeypatch):
     c4g.ROUNDS = 5
     c4g.SEEDS = range(1)
 
-    cas_m, cas_s, r_m, r_s, mc_m, mc_s = c4g.run_setting([8, 8], "relu", torch.relu)
+    cas_m, cas_s, r_m, r_s, mc_m, mc_s, _ = c4g.run_setting([8, 8], "relu", torch.relu)
 
     assert cas_m.size == cas_s.size
     assert mc_m.size == mc_s.size

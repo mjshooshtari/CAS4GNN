@@ -11,8 +11,8 @@ import cas4gnn_batch as c4g
 from sklearn.preprocessing import StandardScaler
 
 
-def dummy_train_round(net, data, train_idx, val_idx, opt, sched):
-    return net
+def dummy_train_round(net, data, train_idx, val_idx, **kwargs):
+    return net, [], [], []
 
 
 def test_scaler_uses_train_only(monkeypatch):
