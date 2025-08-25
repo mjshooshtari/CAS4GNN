@@ -108,10 +108,44 @@ EPS_RANK = 1e-6
 CHK = 1_000
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# preset schedules: "S1" and "S2" encourage adaptivity before the pool empties
+SCHEDULES = {
+    "S1": (300, 150, 10),  # up to 1,800 labels
+    "S2": (400, 200, 8),   # up to 2,000 labels
+}
+
+
+def apply_schedule(args: argparse.Namespace) -> argparse.Namespace:
+    """Override m0/inc/rounds if a preset schedule is requested."""
+
+    if args.schedule in SCHEDULES:
+        args.m0, args.inc, args.rounds = SCHEDULES[args.schedule]
+    return args
+
+
+def estimate_remaining(
+    n_nodes: int,
+    val_count: int,
+    m0: int,
+    inc: int,
+    rounds: int,
+    test_frac: float = TEST_FRAC,
+) -> int:
+    """Estimated unlabeled nodes after the active-learning budget."""
+
+    train_pool = int(n_nodes * (1 - test_frac)) - val_count
+    return max(0, train_pool - (m0 + inc * rounds))
+
 parser = argparse.ArgumentParser(description="Synthetic regression with CAS vs MC")
 parser.add_argument("--rounds", type=int, default=ROUNDS, help="Active learning rounds")
 parser.add_argument("--m0", type=int, default=M0, help="Initial labeled samples")
 parser.add_argument("--inc", type=int, default=INC, help="Samples added per round")
+parser.add_argument(
+    "--schedule",
+    choices=("S1", "S2", "custom"),
+    default="custom",
+    help="Budget schedule preset",
+)
 parser.add_argument(
     "--seed",
     type=int,
@@ -501,7 +535,7 @@ def plot_group(depth, dct, ylabel, fname):
 
 
 if __name__ == "__main__":
-    args = parser.parse_args()
+    args = apply_schedule(parser.parse_args())
     if args.smoke:
         args.depths = [2]
         args.acts = ["relu"]
@@ -511,6 +545,12 @@ if __name__ == "__main__":
         args.inc = 10
         args.n_nodes = 200
         args.val_count = 20
+    remaining = estimate_remaining(
+        args.n_nodes, args.val_count, args.m0, args.inc, args.rounds, TEST_FRAC
+    )
+    print(
+        f"Budget: M0={args.m0} INC={args.inc} ROUNDS={args.rounds} → ~{remaining} unlabeled remain"
+    )
     if args.cpu:
         device = torch.device("cpu")
     SEEDS = args.seed

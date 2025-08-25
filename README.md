@@ -16,3 +16,12 @@ Use `--smoke` for a quick CPU-only run. The script writes per-round metrics to `
 
 - `mse_vs_samples_<depth>layer.png` – Test MSE curves for CAS and MC (log scale).
 - `rank_vs_samples_<depth>layer.png` – CAS-only numerical rank.
+
+## Schedule presets
+
+`cas4gnn_batch.py` accepts `--schedule {S1,S2,custom}` to apply budget presets:
+
+- **S1** – `M0=300`, `INC=150`, `ROUNDS=10` (≈1,800 labels)
+- **S2** – `M0=400`, `INC=200`, `ROUNDS=8` (≈2,000 labels)
+
+The default `custom` leaves `--m0`, `--inc`, and `--rounds` unchanged. Each run prints a budget summary, and `--smoke` overrides all parameters for tiny CI runs.
