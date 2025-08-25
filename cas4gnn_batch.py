@@ -9,9 +9,77 @@ import torch
 import matplotlib.pyplot as plt
 import networkx as nx
 import scipy.linalg as sla
+from scipy.special import iv
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.utils import from_networkx
 from torch_geometric.nn import GCNConv
+
+
+# ---- Graph heat filtering via Chebyshev polynomials ----
+def normalized_adj(edge_index: torch.Tensor, num_nodes: int, device):
+    """Return D^{-1/2} A D^{-1/2} as a sparse COO tensor (symmetrized)."""
+
+    row, col = edge_index
+    vals = torch.ones(row.numel(), device=device)
+    A = torch.sparse_coo_tensor(
+        torch.stack([row, col]), vals, (num_nodes, num_nodes)
+    ).coalesce()
+    A = (A + A.transpose(0, 1)).coalesce()
+    deg = torch.sparse.sum(A, dim=1).to_dense().clamp_min_(1e-8)
+    dmh = deg.pow(-0.5)
+    r, c = A.indices()
+    v = A.values() * dmh[r] * dmh[c]
+    return torch.sparse_coo_tensor(A.indices(), v, A.size(), device=device).coalesce()
+
+
+@torch.no_grad()
+def heat_filter_sparse(A_norm: torch.Tensor, X: torch.Tensor, t: float, K: int = 10):
+    """Chebyshev approximation of heat diffusion exp(-tL) X."""
+
+    coeffs = [np.exp(-t) * iv(0, t)] + [
+        2.0 * np.exp(-t) * iv(k, t) for k in range(1, K + 1)
+    ]
+    coeffs = [torch.as_tensor(c, dtype=X.dtype, device=X.device) for c in coeffs]
+
+    T0 = X
+    out = coeffs[0] * T0
+    if K >= 1:
+        T1 = torch.sparse.mm(A_norm, X)
+        out = out + coeffs[1] * T1
+    for k in range(2, K + 1):
+        Tk = 2.0 * torch.sparse.mm(A_norm, T1) - T0
+        out = out + coeffs[k] * Tk
+        T0, T1 = T1, Tk
+    return out
+
+
+@torch.no_grad()
+def make_graph_target(
+    edge_index: torch.Tensor,
+    num_nodes: int,
+    X: torch.Tensor,
+    t1: float = 0.5,
+    t2: float = 2.0,
+    alpha: float = 1.0,
+    beta: float = 0.5,
+    noise: float = 0.0,
+    K: int = 10,
+):
+    """Graph-aware regression target via heat kernels at two scales."""
+
+    A_norm = normalized_adj(edge_index, num_nodes, X.device)
+    H1 = heat_filter_sparse(A_norm, X, t=t1, K=K)
+    H2 = heat_filter_sparse(A_norm, X, t=t2, K=K)
+    w1 = torch.randn(X.size(1), device=X.device)
+    w2 = torch.randn(X.size(1), device=X.device)
+    h1 = H1 @ w1
+    g2 = H2 @ w2
+    h2 = H2 @ w1
+    y = alpha * torch.tanh(h1 * g2) + beta * torch.sin(h2)
+    if noise > 0.0:
+        y = y + noise * torch.randn_like(y)
+    return y.unsqueeze(1)
+
 
 # ───── experiment grid ────────────────────────────────────
 DEPTH2 = [[8, 8], [16, 16], [32, 32]]
@@ -32,6 +100,10 @@ TEST_FRAC = 0.70
 VAL_COUNT = 500  # Option A
 M0, INC = 500, 500
 ROUNDS = 5  # 500 → 3 000 labels
+T1, T2 = 0.5, 2.0
+ALPHA, BETA = 1.0, 0.5
+NOISE = 0.0
+CHEBY_K = 10
 EPS_RANK = 1e-6
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -71,15 +143,16 @@ parser.add_argument(
     action="store_true",
     help="Run tiny, fast settings for CI",
 )
+parser.add_argument("--t1", type=float, default=T1, help="Heat diffusion scale t1")
+parser.add_argument("--t2", type=float, default=T2, help="Heat diffusion scale t2")
+parser.add_argument("--alpha", type=float, default=ALPHA, help="Target alpha")
+parser.add_argument("--beta", type=float, default=BETA, help="Target beta")
+parser.add_argument("--noise", type=float, default=NOISE, help="Target noise level")
+parser.add_argument(
+    "--cheby-K", type=int, default=CHEBY_K, help="Chebyshev polynomial order"
+)
 
 LOG_FILE = "Experiment.log"
-
-
-# ───── label function ────────────────────────────────────
-def compute_label(f):
-    return 2 * f[0] + 3 * f[1] + 4 * f[2] + 5 * f[3] + 6 * f[4] + np.sin(f[0] * f[4])
-
-
 # ───── GCN (last layer linear) ───────────────────────────
 class GCN(torch.nn.Module):
     def __init__(self, in_dim, hidden, out_dim, act):
@@ -163,11 +236,32 @@ def run_setting(hidden, act_name, act_fn):
         np.random.seed(seed)
         random.seed(seed)
 
-        # build graph & labels
+        # build graph & data
         G = nx.random_geometric_graph(N_NODES, 0.05)
         feats = np.random.rand(N_NODES, 5).astype(np.float32)
-        raw_labels = np.array([compute_label(f) for f in feats], dtype=np.float32)
-        feats_scaled = feats
+        for i in range(N_NODES):
+            G.nodes[i]["x"] = feats[i]
+        data = from_networkx(G)
+        data.x = torch.from_numpy(feats).to(device)
+        data.edge_index = data.edge_index.to(device)
+
+        # precompute heat-filtered features and targets
+        A_norm = normalized_adj(data.edge_index, N_NODES, device)
+        with torch.no_grad():
+            X_t1 = heat_filter_sparse(A_norm, data.x, t=T1, K=CHEBY_K)
+            X_t2 = heat_filter_sparse(A_norm, data.x, t=T2, K=CHEBY_K)
+            y_raw = make_graph_target(
+                data.edge_index,
+                N_NODES,
+                data.x,
+                t1=T1,
+                t2=T2,
+                alpha=ALPHA,
+                beta=BETA,
+                noise=NOISE,
+                K=CHEBY_K,
+            )
+        data.x = torch.cat([data.x, X_t1, X_t2], dim=1)
 
         # splits
         all_idx = np.arange(N_NODES)
@@ -176,23 +270,16 @@ def run_setting(hidden, act_name, act_fn):
         val_idx = np.random.choice(rem, VAL_COUNT, replace=False)
         grid_idx = np.setdiff1d(rem, val_idx)  # |Z| = 2 500
         lab_init = np.random.choice(grid_idx, M0, replace=False)
-
-        # fit scaler on training labels only, then transform full label set
-        scaler = StandardScaler().fit(raw_labels[lab_init].reshape(-1, 1))
-        labels_scaled = scaler.transform(raw_labels.reshape(-1, 1))
-
-        for i, f in enumerate(feats_scaled):
-            G.nodes[i]["x"] = f
-            G.nodes[i]["label"] = labels_scaled[i]
-        data = from_networkx(G)
-        data.x = torch.from_numpy(feats_scaled)
-        data.y = torch.from_numpy(labels_scaled)
+        y_np = y_raw.cpu().numpy()
+        scaler = StandardScaler().fit(y_np[lab_init].reshape(-1, 1))
+        labels_scaled = scaler.transform(y_np)
+        data.y = torch.from_numpy(labels_scaled).to(device)
         data = data.to(device)
 
         for strategy in ("CAS", "MC"):
             labels = lab_init.copy()
             unlab = np.setdiff1d(grid_idx, labels)
-            net = GCN(5, hidden, 1, act_fn).to(device)
+            net = GCN(data.x.size(1), hidden, 1, act_fn).to(device)
             opt = torch.optim.Adam(net.parameters(), lr=0.01)
             # simple exponential learning-rate decay
             sch = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.99)
@@ -295,6 +382,9 @@ if __name__ == "__main__":
     VAL_COUNT = args.val_count
     M0, INC = args.m0, args.inc
     ROUNDS = args.rounds
+    T1, T2 = args.t1, args.t2
+    ALPHA, BETA = args.alpha, args.beta
+    NOISE, CHEBY_K = args.noise, args.cheby_K
     if os.path.exists(LOG_FILE):
         os.remove(LOG_FILE)
     acts = {k: ACTS[k] for k in args.acts}
