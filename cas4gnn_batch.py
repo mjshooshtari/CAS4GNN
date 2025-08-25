@@ -105,6 +105,7 @@ ALPHA, BETA = 1.0, 0.5
 NOISE = 0.0
 CHEBY_K = 10
 EPS_RANK = 1e-6
+CHK = 1_000
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser(description="Synthetic regression with CAS vs MC")
@@ -137,6 +138,7 @@ parser.add_argument(
 parser.add_argument(
     "--val-count", type=int, default=VAL_COUNT, help="Validation node count"
 )
+parser.add_argument("--chk", type=int, default=CHK, help="Validation cadence")
 parser.add_argument("--cpu", action="store_true", help="Force CPU execution")
 parser.add_argument(
     "--smoke",
@@ -200,37 +202,76 @@ def cas_select(unl_pos, pen_grid, m_inc):
     return np.array(picks, dtype=int), r
 
 
-# ───── training routine (50 000 max epochs) ──────────────
-def train_round(net, data, train_idx, val_idx, opt, sched):
+# ───── training routine (representation-active) ───────────
+def train_round(
+    net,
+    data,
+    train_idx: torch.Tensor,
+    val_idx: torch.Tensor,
+    base_lr: float = 1e-2,
+    max_epochs: int = 50_000,
+    chk: int = 1_000,
+    es_patience: int = 10,
+):
+    """Train `net` with fresh optimizer/scheduler each round.
+
+    Returns updated net and histories of train/val/lr values evaluated on
+    the specified cadence."""
+
     crit = torch.nn.MSELoss()
-    best, patience = 1e9, 3
-    stagnant = 0
-    for ep in range(50_000):
+    opt = torch.optim.Adam(net.parameters(), lr=base_lr, weight_decay=5e-5)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=0.5,
+        patience=2,
+        min_lr=1e-5,
+        verbose=False,
+    )
+
+    best_v, best_state, bad = float("inf"), None, 0
+    tr_hist, va_hist, lr_hist = [], [], []
+
+    for ep in range(max_epochs):
         net.train()
         opt.zero_grad()
-        pred, _ = net(data.x, data.edge_index)
-        loss = crit(pred[train_idx], data.y[train_idx])
-        loss.backward()
+        out, _ = net(data.x, data.edge_index)
+        tr_loss = crit(out[train_idx], data.y[train_idx])
+        tr_loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
-        sched.step()
-        if (ep + 1) % 5_000 == 0 or ep == 0:
+
+        # evaluate on a cadence
+        if (ep == 0) or ((ep + 1) % chk == 0):
             net.eval()
             with torch.no_grad():
-                v = crit(
-                    net(data.x, data.edge_index)[0][val_idx], data.y[val_idx]
-                ).item()
-            if v < best - 1e-6:
-                best, stagnant = v, 0
+                out_v, _ = net(data.x, data.edge_index)
+                va_loss = crit(out_v[val_idx], data.y[val_idx]).item()
+                tr_loss_val = tr_loss.item()
+            sch.step(va_loss)
+            tr_hist.append(tr_loss_val)
+            va_hist.append(va_loss)
+            lr_hist.append(sch.optimizer.param_groups[0]["lr"])
+
+            # early stop bookkeeping
+            if va_loss < best_v - 1e-6:
+                best_v = va_loss
+                best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+                bad = 0
             else:
-                stagnant += 1
-            if stagnant >= patience:
+                bad += 1
+            if bad >= es_patience:
                 break
-    return net
+
+    if best_state:
+        net.load_state_dict(best_state)
+    return net, tr_hist, va_hist, lr_hist
 
 
 # ───── one config (hidden, act) over 5 seeds ─────────────
 def run_setting(hidden, act_name, act_fn):
     cas_mses, cas_ranks, mc_mses = [], [], []
+    history_log = {"CAS": [], "MC": []}
     for seed in SEEDS:
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -280,20 +321,69 @@ def run_setting(hidden, act_name, act_fn):
             labels = lab_init.copy()
             unlab = np.setdiff1d(grid_idx, labels)
             net = GCN(data.x.size(1), hidden, 1, act_fn).to(device)
-            opt = torch.optim.Adam(net.parameters(), lr=0.01)
-            # simple exponential learning-rate decay
-            sch = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=0.99)
 
             mses, ranks = [], []
             for r in range(ROUNDS + 1):
-                net = train_round(
+                # ----- PRE-ROUND LOGGING -----
+                with torch.no_grad():
+                    out, _ = net(data.x, data.edge_index)
+                    crit = torch.nn.MSELoss()
+                    pre_tr = crit(
+                        out[torch.tensor(labels, device=device)],
+                        data.y[torch.tensor(labels, device=device)],
+                    ).item()
+                    pre_va = crit(
+                        out[torch.tensor(val_idx, device=device)],
+                        data.y[torch.tensor(val_idx, device=device)],
+                    ).item()
+                    pen = net(data.x, data.edge_index)[1]
+                    pen_grid = (
+                        pen[torch.tensor(grid_idx, device=device)]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    Kgrid = pen_grid.shape[0]
+                    if Kgrid > 0:
+                        U, S, _ = sla.svd(
+                            pen_grid / np.sqrt(Kgrid), full_matrices=False
+                        )
+                        if S[0] > 0:
+                            r_now = int(np.sum(S / S[0] > EPS_RANK))
+                            k_now, s_now = (
+                                INC // max(r_now, 1),
+                                INC - (INC // max(r_now, 1)) * max(r_now, 1),
+                            )
+                            sigma_min = float(S.min())
+                        else:
+                            r_now, k_now, s_now, sigma_min = 0, 0, INC, 0.0
+                    else:
+                        r_now, k_now, s_now, sigma_min = 0, 0, INC, 0.0
+                with open(LOG_FILE, "a") as f:
+                    f.write(
+                        f"[PRE] round {r}  | m={len(labels)}  "
+                        f"train {pre_tr:.6f}  val {pre_va:.6f}  "
+                        f"r {r_now}  k {k_now}  s {s_now}  sigma_min {sigma_min:.3e}\n"
+                    )
+
+                net, tr_hist, va_hist, lr_hist = train_round(
                     net,
                     data,
                     torch.tensor(labels, device=device),
                     torch.tensor(val_idx, device=device),
-                    opt,
-                    sch,
+                    base_lr=1e-2,
+                    max_epochs=50_000,
+                    chk=CHK,
+                    es_patience=10,
                 )
+
+                if len(va_hist):
+                    with open(LOG_FILE, "a") as f:
+                        f.write(
+                            f"[POST] round {r}  last_train {tr_hist[-1]:.6f}  "
+                            f"last_val {va_hist[-1]:.6f}  last_lr {lr_hist[-1]:.5f}\n"
+                        )
+
                 mse = torch.nn.MSELoss()(
                     net(data.x, data.edge_index)[0][
                         torch.tensor(test_idx, device=device)
@@ -305,6 +395,47 @@ def run_setting(hidden, act_name, act_fn):
                     f.write(
                         f"{strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
                     )
+
+                # SVD for sampling stats
+                with torch.no_grad():
+                    pen = net(data.x, data.edge_index)[1]
+                pen_grid = pen[torch.tensor(grid_idx, device=device)].cpu().numpy()
+                U, S, _ = (
+                    sla.svd(pen_grid / np.sqrt(len(grid_idx)), full_matrices=False)
+                    if len(grid_idx) > 0
+                    else (None, np.array([0.0]), None)
+                )
+                if S[0] > 0:
+                    r_use = int(np.sum(S / S[0] > EPS_RANK))
+                    k_use, s_use = (
+                        INC // max(r_use, 1),
+                        INC - (INC // max(r_use, 1)) * max(r_use, 1),
+                    )
+                    sigma_min_use = float(S.min())
+                else:
+                    r_use, k_use, s_use, sigma_min_use = 0, 0, INC, 0.0
+                with open(LOG_FILE, "a") as f:
+                    f.write(
+                        f"[SAMPLE] round {r}  r {r_use}  k {k_use}  s {s_use}  "
+                        f"sigma_min {sigma_min_use:.3e}\n"
+                    )
+
+                history_log[strategy].append(
+                    {
+                        "seed": seed,
+                        "round": r,
+                        "pre_val": pre_va,
+                        "final_val": va_hist[-1] if va_hist else None,
+                        "train_curve": tr_hist,
+                        "val_curve": va_hist,
+                        "lr_curve": lr_hist,
+                        "sigma_min": sigma_min_use,
+                        "r": r_use,
+                        "k": k_use,
+                        "s": s_use,
+                    }
+                )
+
                 if r == ROUNDS:
                     break
 
@@ -312,9 +443,6 @@ def run_setting(hidden, act_name, act_fn):
                 if inc_now == 0:
                     break
                 if strategy == "CAS":
-                    with torch.no_grad():
-                        pen = net(data.x, data.edge_index)[1]
-                    pen_grid = pen[torch.tensor(grid_idx, device=device)].cpu().numpy()
                     unl_pos = np.searchsorted(grid_idx, unlab)
                     new_pos, rk = cas_select(unl_pos, pen_grid, inc_now)
                     new_ids = grid_idx[new_pos]
@@ -342,7 +470,15 @@ def run_setting(hidden, act_name, act_fn):
         _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
     )
 
-    return cas_m_mean, cas_m_std, cas_r_mean, cas_r_std, mc_m_mean, mc_m_std
+    return (
+        cas_m_mean,
+        cas_m_std,
+        cas_r_mean,
+        cas_r_std,
+        mc_m_mean,
+        mc_m_std,
+        history_log,
+    )
 
 
 # ───── plot helper ────────────────────────────────────────
@@ -381,6 +517,7 @@ if __name__ == "__main__":
     N_NODES = args.n_nodes
     VAL_COUNT = args.val_count
     M0, INC = args.m0, args.inc
+    CHK = args.chk
     ROUNDS = args.rounds
     T1, T2 = args.t1, args.t2
     ALPHA, BETA = args.alpha, args.beta
@@ -399,7 +536,7 @@ if __name__ == "__main__":
                     else f"{widths[1]}_{act_name}"
                 )
                 print(f"[{depth}-layer] {widths}  act={act_name}")
-                cas_m, cas_s, r_m, r_s, mc_m, mc_s = run_setting(
+                cas_m, cas_s, r_m, r_s, mc_m, mc_s, _ = run_setting(
                     widths, act_name, act_fn
                 )
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
