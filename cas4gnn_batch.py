@@ -2,8 +2,8 @@
 # cas4gnn_batch.py  –  synthetic regression with CAS vs MC
 # --------------------------------------------------------
 import argparse
-import os
 import random
+from pathlib import Path
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -13,6 +13,8 @@ from scipy.special import iv
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.utils import from_networkx
 from torch_geometric.nn import GCNConv
+
+from run_utils import prepare_run, write_run_config
 
 
 # ---- Graph heat filtering via Chebyshev polynomials ----
@@ -187,8 +189,16 @@ parser.add_argument("--noise", type=float, default=NOISE, help="Target noise lev
 parser.add_argument(
     "--cheby-K", type=int, default=CHEBY_K, help="Chebyshev polynomial order"
 )
+parser.add_argument("--outdir", type=str, default="results", help="Base output directory")
+parser.add_argument("--run-name", type=str, default=None, help="Optional run name")
+parser.add_argument("--exp-name", type=str, default=None, help="Experiment namespace override")
 
-LOG_FILE = "Experiment.log"
+DEFAULT_EXP = Path(__file__).stem.split("_")[0].replace("batch", "")
+if DEFAULT_EXP not in {"cas4gnn", "cas4dl"}:
+    DEFAULT_EXP = "cas4gnn"
+RUN_DIR = Path(".")
+LOG_FILE = RUN_DIR / "Experiment.log"
+EXPERIMENT = DEFAULT_EXP
 # ───── GCN (last layer linear) ───────────────────────────
 class GCN(torch.nn.Module):
     def __init__(self, in_dim, hidden, out_dim, act):
@@ -255,12 +265,7 @@ def train_round(
     crit = torch.nn.MSELoss()
     opt = torch.optim.Adam(net.parameters(), lr=base_lr, weight_decay=5e-5)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt,
-        mode="min",
-        factor=0.5,
-        patience=2,
-        min_lr=1e-5,
-        verbose=False,
+        opt, mode="min", factor=0.5, patience=2, min_lr=1e-5
     )
 
     best_v, best_state, bad = float("inf"), None, 0
@@ -395,7 +400,7 @@ def run_setting(hidden, act_name, act_fn):
                         r_now, k_now, s_now, sigma_min = 0, 0, INC, 0.0
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"[PRE] round {r}  | m={len(labels)}  "
+                        f"[{EXPERIMENT}] [PRE] round {r}  | m={len(labels)}  "
                         f"train {pre_tr:.6f}  val {pre_va:.6f}  "
                         f"r {r_now}  k {k_now}  s {s_now}  sigma_min {sigma_min:.3e}\n"
                     )
@@ -414,7 +419,7 @@ def run_setting(hidden, act_name, act_fn):
                 if len(va_hist):
                     with open(LOG_FILE, "a") as f:
                         f.write(
-                            f"[POST] round {r}  last_train {tr_hist[-1]:.6f}  "
+                            f"[{EXPERIMENT}] [POST] round {r}  last_train {tr_hist[-1]:.6f}  "
                             f"last_val {va_hist[-1]:.6f}  last_lr {lr_hist[-1]:.5f}\n"
                         )
 
@@ -427,7 +432,7 @@ def run_setting(hidden, act_name, act_fn):
                 mses.append(mse)
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"{strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
+                        f"[{EXPERIMENT}] {strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
                     )
 
                 # SVD for sampling stats
@@ -450,7 +455,7 @@ def run_setting(hidden, act_name, act_fn):
                     r_use, k_use, s_use, sigma_min_use = 0, 0, INC, 0.0
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"[SAMPLE] round {r}  r {r_use}  k {k_use}  s {s_use}  "
+                        f"[{EXPERIMENT}] [SAMPLE] round {r}  r {r_use}  k {k_use}  s {s_use}  "
                         f"sigma_min {sigma_min_use:.3e}\n"
                     )
 
@@ -562,8 +567,12 @@ if __name__ == "__main__":
     T1, T2 = args.t1, args.t2
     ALPHA, BETA = args.alpha, args.beta
     NOISE, CHEBY_K = args.noise, args.cheby_K
-    if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
+    RUN_DIR, EXPERIMENT = prepare_run(
+        args.outdir, DEFAULT_EXP, args.run_name, args.exp_name
+    )
+    LOG_FILE = RUN_DIR / "Experiment.log"
+    write_run_config(RUN_DIR, EXPERIMENT, args)
+    print(f"Run directory: {RUN_DIR}")
     acts = {k: ACTS[k] for k in args.acts}
     for depth in args.depths:
         width_list = WIDTHS[depth]
@@ -582,7 +591,9 @@ if __name__ == "__main__":
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
                 mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
                 rank_dict[f"{tag}_CAS"] = (r_m, r_s)
-        plot_group(depth, mse_dict, "Test MSE", f"mse_vs_samples_{depth}layer.png")
         plot_group(
-            depth, rank_dict, "Numerical rank r", f"rank_vs_samples_{depth}layer.png"
+            depth, mse_dict, "Test MSE", RUN_DIR / f"mse_vs_samples_{depth}layer.png"
+        )
+        plot_group(
+            depth, rank_dict, "Numerical rank r", RUN_DIR / f"rank_vs_samples_{depth}layer.png"
         )

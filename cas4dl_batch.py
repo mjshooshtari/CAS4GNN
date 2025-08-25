@@ -2,8 +2,8 @@
 # cas4dl_batch.py  –  synthetic regression with CAS vs MC using MLP
 # ---------------------------------------------------------------
 import argparse
-import os
 import random
+from pathlib import Path
 from types import SimpleNamespace
 
 import matplotlib.pyplot as plt
@@ -12,6 +12,8 @@ import numpy as np
 import scipy.linalg as sla
 import torch
 from sklearn.preprocessing import StandardScaler
+
+from run_utils import prepare_run, write_run_config
 
 # ───── experiment grid ────────────────────────────────────
 DEPTH2 = [[10, 10], [20, 20], [30, 30]]
@@ -63,8 +65,16 @@ parser.add_argument(
     action="store_true",
     help="Run tiny, fast settings for CI",
 )
+parser.add_argument("--outdir", type=str, default="results", help="Base output directory")
+parser.add_argument("--run-name", type=str, default=None, help="Optional run name")
+parser.add_argument("--exp-name", type=str, default=None, help="Experiment namespace override")
 
-LOG_FILE = "Experiment.log"
+DEFAULT_EXP = Path(__file__).stem.split("_")[0].replace("batch", "")
+if DEFAULT_EXP not in {"cas4gnn", "cas4dl"}:
+    DEFAULT_EXP = "cas4dl"
+RUN_DIR = Path(".")
+LOG_FILE = RUN_DIR / "Experiment.log"
+EXPERIMENT = DEFAULT_EXP
 
 
 # ───── label function ────────────────────────────────────
@@ -201,7 +211,7 @@ def run_setting(hidden, act_name, act_fn):
                 mses.append(mse)
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"{strategy}_MLP_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
+                        f"[{EXPERIMENT}] {strategy}_MLP_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
                     )
                 if r == ROUNDS:
                     break
@@ -283,8 +293,12 @@ if __name__ == "__main__":
     VAL_COUNT = args.val_count
     M0, INC = args.m0, args.inc
     ROUNDS = args.rounds
-    if os.path.exists(LOG_FILE):
-        os.remove(LOG_FILE)
+    RUN_DIR, EXPERIMENT = prepare_run(
+        args.outdir, DEFAULT_EXP, args.run_name, args.exp_name
+    )
+    LOG_FILE = RUN_DIR / "Experiment.log"
+    write_run_config(RUN_DIR, EXPERIMENT, args)
+    print(f"Run directory: {RUN_DIR}")
     acts = {k: ACTS[k] for k in args.acts}
     for depth in args.depths:
         width_list = WIDTHS[depth]
@@ -303,7 +317,9 @@ if __name__ == "__main__":
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
                 mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
                 rank_dict[f"{tag}_CAS"] = (r_m, r_s)
-        plot_group(depth, mse_dict, "Test MSE", f"mse_vs_samples_{depth}layer.png")
         plot_group(
-            depth, rank_dict, "Numerical rank r", f"rank_vs_samples_{depth}layer.png"
+            depth, mse_dict, "Test MSE", RUN_DIR / f"mse_vs_samples_{depth}layer.png"
+        )
+        plot_group(
+            depth, rank_dict, "Numerical rank r", RUN_DIR / f"rank_vs_samples_{depth}layer.png"
         )
