@@ -1,60 +1,46 @@
-# AGENTS.md — Guidance for Coding Agents (Codex, etc.)
+# AGENTS.md — Guidance for Coding Agents
 
-This document tells agents how to set up, run, and verify work in the **CAS4GNN** repository.
+This document outlines how to work with the **CAS4GNN** repository.
 
-## Repository Purpose
-Active learning for GNNs comparing **CAS** (Characteristic/Compressed Active Sampling) vs **Monte Carlo** baselines on:
-- **Synthetic regression graph** (`cas4gnn_batch.py`)
-- **CORA node classification** (`cora_batch.py`)
+## Workflow
+- Base branch is `main`; open pull requests from feature branches.
+- Prefer CPU execution. Detect CUDA but avoid CUDA-only features.
+- Keep diffs small and focused.
 
-## Tech Stack & Constraints
-- Python ≥ 3.10
-- PyTorch and PyTorch Geometric (PyG)
-- numpy, scipy, scikit-learn, networkx, matplotlib
-- GPU optional; code must run on CPU. If GPU is available, it may be used but should not be *required*.
-
-## Environment Setup
-
-> Agents must detect CUDA availability and install compatible wheels. Prefer CPU by default to avoid CUDA mismatch.
-
+## Running experiments
 ```bash
-# Create env (adjust for conda/uv/venv as needed)
-python -m venv .venv
-. .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# Install PyTorch (CPU by default)
-pip install --upgrade pip
-pip install "torch>=2.2,<3.0" --index-url https://download.pytorch.org/whl/cpu
-
-# Install PyG (CPU wheels)
-pip install "torch-geometric>=2.5,<3.0" "torch-scatter>=2.1,<3.0" "torch-sparse>=0.6,<1.0" "torch-cluster>=1.6,<2.0" "torch-spline-conv>=1.2,<2.0" -f https://data.pyg.org/whl/torch-2.2.0+cpu.html
-
-# Core deps
-pip install numpy scipy scikit-learn networkx matplotlib
-
-## CLI & Smoke Mode
-
-Both experiment scripts (`cas4gnn_batch.py` and `cora_batch.py`) accept CLI flags:
-
-- `--rounds`, `--m0`, `--inc` – active learning schedule
-- `--seed` – one or more random seeds
-- `--acts` – activation functions to try
-- `--depths` – model depths (2, 3, 4)
-- `--cpu` – force CPU even if CUDA is available
-- Synthetic only: `--n-nodes`, `--val-count`
-- `--smoke` – override all params to a tiny profile for quick checks
-
-Smoke profile:
-
-- Synthetic: 200 nodes, `m0=10`, `inc=10`, `rounds=1`, `val-count=20`, depths `[2]`, acts `['relu']`, seed `0`
-- Cora: `m0=20`, `inc=20`, `rounds=1`, depths `[2]`, acts `['relu']`, seed `0`
-
-Outputs and filenames remain unchanged for default runs (figures + `Experiment.log`).
-
-## How to Run (MLP)
-
-```bash
-python cas4dl_batch.py --smoke --depths 2 --acts relu --seed 0 --cpu
+python cas4gnn_batch.py --smoke --cpu
+python cas4dl_batch.py --smoke --cpu
+python cora_batch.py --smoke --cpu
 ```
+Always use `--smoke` for quick, CPU-safe verification.
 
-CAS math mirrors the GNN version; embeddings are taken from the MLP's penultimate layer.
+## Results pipeline
+- Runs write to `results/<experiment>/<timestamp>[_run-name]/`.
+- `results/<experiment>/latest` and `results/latest` symlink to the newest run.
+- Each run directory must contain `Experiment.log`, `run_config.json`, and figures `mse_vs_samples_<depth>layer.png` and `rank_vs_samples_<depth>layer.png`.
+
+## CAS invariants
+- Build `B` from penultimate embeddings and scale by `1/√K`.
+- SVD with rank threshold `EPS_RANK=1e-6`.
+- Measures are `|U·j|²`; compute `k, s = divmod(m_inc, r)`.
+- Sample without replacement across the entire increment.
+- Rank-0 fallback samples uniformly.
+- MC baseline is computed and plotted in MSE curves.
+
+## CLI & Presets
+- `--schedule {S1,S2,custom}`: S1=300/150/10, S2=400/200/8.
+- Heat-filter knobs (GNN): `--t1`, `--t2`, `--alpha`, `--beta`, `--noise`, `--cheby-K`.
+- Validation cadence: `--chk`.
+- Always pass `--smoke` for verification runs.
+
+## Don’ts
+- Do not modify algorithms or schedules unless explicitly tasked.
+- No CUDA-only code.
+- Keep diffs small.
+
+## PR checklist
+1. Plan the change and obtain approval.
+2. Implement minimal diffs.
+3. Provide smoke-run evidence (run directory tree and `Experiment.log` tail).
+4. Ensure plots and logs are present.

@@ -1,27 +1,68 @@
 # CAS4GNN
 
-Benchmarks for Characteristic Active Sampling (CAS) versus Monte Carlo baselines on synthetic regression graphs and the Cora dataset.
+## Summary
+Characteristic Active Sampling (CAS) experiments for graph neural networks and multilayer perceptrons compare CAS against Monte Carlo (MC) baselines on synthetic regression graphs and the Cora node-classification benchmark. Runs produce metrics and plots for test mean-squared error (MSE) and numerical rank while logging summaries per round.
 
-## CAS4DL (MLP)
-
-`cas4dl_batch.py` reproduces the synthetic CAS vs MC experiment using a feed-forward MLP instead of a GNN. The active-learning schedule and CAS mechanics mirror the GNN version, with embeddings taken from the MLP's penultimate layer.
-
-### Usage
-
+## Quickstart (CPU)
 ```bash
-python cas4dl_batch.py --depths 2 --acts relu
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python cas4gnn_batch.py --smoke --cpu
+python cas4dl_batch.py --smoke --cpu
+```
+To smoke-test the Cora script:
+```bash
+python cora_batch.py --smoke --cpu
 ```
 
-Use `--smoke` for a quick CPU-only run. The script writes per-round metrics to `Experiment.log` and saves:
+## CLI reference
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--rounds` | int | 5 | Active learning rounds |
+| `--m0` | int | 500 | Initial labeled samples |
+| `--inc` | int | 500 | Samples added per round |
+| `--schedule` | str | custom | Budget preset (S1:300/150/10, S2:400/200/8) |
+| `--seed` | int list | 0 1 2 3 4 | Random seeds |
+| `--acts` | str list | relu tanh elu | Activation functions |
+| `--depths` | int list | 2 3 4 | Model depths |
+| `--n-nodes` | int | 10000 | Synthetic node count |
+| `--val-count` | int | 500 | Validation node count |
+| `--chk` | int | 1000 | Validation cadence (GNN) |
+| `--t1` | float | 0.5 | Heat diffusion scale t1 (GNN) |
+| `--t2` | float | 2.0 | Heat diffusion scale t2 (GNN) |
+| `--alpha` | float | 1.0 | Target alpha (GNN) |
+| `--beta` | float | 0.5 | Target beta (GNN) |
+| `--noise` | float | 0.0 | Target noise level (GNN) |
+| `--cheby-K` | int | 10 | Chebyshev polynomial order (GNN) |
+| `--cpu` | flag | False | Force CPU execution |
+| `--smoke` | flag | False | Tiny profile for quick checks |
+| `--outdir` | str | results | Base output directory |
+| `--run-name` | str | None | Optional run identifier |
+| `--exp-name` | str | None | Experiment namespace override |
 
-- `mse_vs_samples_<depth>layer.png` – Test MSE curves for CAS and MC (log scale).
-- `rank_vs_samples_<depth>layer.png` – CAS-only numerical rank.
+## Results & artifacts
+- Runs are saved under `results/<experiment>/<timestamp>[_run-name]/`.
+- `results/<experiment>/latest` and `results/latest` point to the most recent run.
+- Each run directory contains `Experiment.log`, `run_config.json`, and per-depth figures `mse_vs_samples_<depth>layer.png` and `rank_vs_samples_<depth>layer.png`.
+- The run's `Experiment.log` logs one-line summaries per round.
 
-## Schedule presets
+## Figures generated
+- `mse_vs_samples_<depth>layer.png` – CAS and MC test MSE vs. labeled samples.
+- `rank_vs_samples_<depth>layer.png` – CAS numerical rank vs. labeled samples.
 
-`cas4gnn_batch.py` accepts `--schedule {S1,S2,custom}` to apply budget presets:
+## Reproducibility
+- Random seeds controlled via `--seed`; dtype is float32.
+- Works on CPU or GPU; smoke runs complete in seconds, full runs take minutes per depth.
+- For deterministic CPU runs, pass `--cpu`.
 
-- **S1** – `M0=300`, `INC=150`, `ROUNDS=10` (≈1,800 labels)
-- **S2** – `M0=400`, `INC=200`, `ROUNDS=8` (≈2,000 labels)
+## CI
+GitHub Actions installs CPU wheels and runs `pytest` on pushes and pull requests.
 
-The default `custom` leaves `--m0`, `--inc`, and `--rounds` unchanged. Each run prints a budget summary, and `--smoke` overrides all parameters for tiny CI runs.
+## Contributing
+1. Branch from `main` and keep diffs small.
+2. Document intent and include smoke-run evidence.
+3. Open a pull request when tests pass.
+
+## License
+This project is licensed under the terms of the [LICENSE](LICENSE).
