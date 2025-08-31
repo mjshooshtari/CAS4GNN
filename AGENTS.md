@@ -30,7 +30,7 @@ Always use `--smoke` for quick, CPU-safe verification.
 
 ## CLI & Presets
 - `--schedule {S1,S2,custom}`: S1=300/150/10, S2=400/200/8.
-- Heat-filter knobs (GNN): `--t1`, `--t2`, `--alpha`, `--beta`, `--noise`, `--cheby-K`.
+- Heat-filter knobs: `--t1`, `--t2`, `--alpha`, `--beta`, `--noise`, `--cheby-K`.
 - Validation cadence: `--chk`.
 - Always pass `--smoke` for verification runs.
 

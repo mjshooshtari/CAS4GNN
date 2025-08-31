@@ -28,13 +28,13 @@ python cora_batch.py --smoke --cpu
 | `--depths` | int list | 2 3 4 | Model depths |
 | `--n-nodes` | int | 10000 | Synthetic node count |
 | `--val-count` | int | 500 | Validation node count |
-| `--chk` | int | 1000 | Validation cadence (GNN) |
-| `--t1` | float | 0.5 | Heat diffusion scale t1 (GNN) |
-| `--t2` | float | 2.0 | Heat diffusion scale t2 (GNN) |
-| `--alpha` | float | 1.0 | Target alpha (GNN) |
-| `--beta` | float | 0.5 | Target beta (GNN) |
-| `--noise` | float | 0.0 | Target noise level (GNN) |
-| `--cheby-K` | int | 10 | Chebyshev polynomial order (GNN) |
+| `--chk` | int | 1000 | Validation cadence |
+| `--t1` | float | 0.5 | Heat diffusion scale t1 |
+| `--t2` | float | 2.0 | Heat diffusion scale t2 |
+| `--alpha` | float | 1.0 | Target alpha |
+| `--beta` | float | 0.5 | Target beta |
+| `--noise` | float | 0.0 | Target noise level |
+| `--cheby-K` | int | 10 | Chebyshev polynomial order |
 | `--cpu` | flag | False | Force CPU execution |
 | `--smoke` | flag | False | Tiny profile for quick checks |
 | `--outdir` | str | results | Base output directory |
