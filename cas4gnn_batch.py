@@ -12,7 +12,7 @@ import networkx as nx
 import scipy.linalg as sla
 from scipy.special import iv
 from sklearn.preprocessing import StandardScaler
-from torch_geometric.utils import from_networkx
+from torch_geometric.utils import from_networkx, degree
 from torch_geometric.nn import GCNConv
 
 from run_utils import prepare_run, write_run_config
@@ -84,6 +84,47 @@ def make_graph_target(
     if noise > 0.0:
         y = y + noise * torch.randn_like(y)
     return y.unsqueeze(1)
+
+
+# ---- Christoffel weighting helpers ---------------------------------
+@torch.no_grad()
+def compute_christoffel_weights(
+    pen_grid: torch.Tensor,
+    rho_grid: torch.Tensor,
+    sv_tol: float = 1e-6,
+):
+    """Christoffel weights w = 1/(K_i + eps) on the grid Z.
+
+    `pen_grid` is the penultimate embedding matrix evaluated on Z and
+    `rho_grid` the positive measure weights for the same nodes.
+    The embeddings are measure-scaled before computing an SVD whose
+    truncated left singular vectors define the discrete Christoffel
+    function. We keep singular values above `sv_tol` relative to the
+    largest one, matching the rank criterion used for CAS selection.
+    """
+
+    K = pen_grid.size(0)
+    if K == 0:
+        return torch.empty_like(rho_grid), torch.empty(0), 0
+
+    # Normalize rho so sum rho == K for numerical stability
+    rho_norm = rho_grid * (K / rho_grid.sum())
+    Phi_tilde = pen_grid * rho_norm.sqrt().unsqueeze(1)
+
+    U, S, _ = torch.linalg.svd(Phi_tilde, full_matrices=False)
+    rel = S / S[0].clamp_min(1e-12)
+    r = int((rel >= sv_tol).sum().item())
+    r = max(1, r)
+    U_r = U[:, :r]
+    KZ = (U_r**2).sum(dim=1)
+    eps = (KZ.median() * 1e-6).clamp_min(1e-12)
+    w = 1.0 / (KZ + eps)
+    return w, S, r
+
+
+def weighted_mse_loss(pred: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
+    diff = pred - y
+    return (w * diff.pow(2)).sum() / w.sum().clamp_min(1e-12)
 
 
 # ───── experiment grid ────────────────────────────────────
@@ -255,6 +296,7 @@ def train_round(
     data,
     train_idx: torch.Tensor,
     val_idx: torch.Tensor,
+    weights: torch.Tensor | None = None,
     base_lr: float = 1e-2,
     max_epochs: int = 50_000,
     chk: int = 1_000,
@@ -265,8 +307,7 @@ def train_round(
     Returns updated net and histories of train/val/lr values evaluated on
     the specified cadence."""
 
-    crit = torch.nn.MSELoss()
-    # TODO[CAS-weights]: replace with weighted MSE when weights are available
+    crit = torch.nn.MSELoss(reduction="none")
     opt = torch.optim.Adam(net.parameters(), lr=base_lr, weight_decay=5e-5)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.5, patience=2, min_lr=1e-5
@@ -279,8 +320,14 @@ def train_round(
         net.train()
         opt.zero_grad()
         out, _ = net(data.x, data.edge_index)
-        # TODO[CAS-weights]: incorporate per-sample weights here
-        tr_loss = crit(out[train_idx], data.y[train_idx])
+        pred = out.squeeze()
+        target = data.y.squeeze()
+        if weights is None:
+            tr_loss = crit(pred[train_idx], target[train_idx]).mean()
+        else:
+            tr_loss = weighted_mse_loss(
+                pred[train_idx], target[train_idx], weights[train_idx]
+            )
         tr_loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
@@ -290,7 +337,14 @@ def train_round(
             net.eval()
             with torch.no_grad():
                 out_v, _ = net(data.x, data.edge_index)
-                va_loss = crit(out_v[val_idx], data.y[val_idx]).item()
+                if weights is None:
+                    va_loss = crit(out_v.squeeze()[val_idx], data.y.squeeze()[val_idx]).mean().item()
+                else:
+                    va_loss = weighted_mse_loss(
+                        out_v.squeeze()[val_idx],
+                        data.y.squeeze()[val_idx],
+                        weights[val_idx],
+                    ).item()
                 tr_loss_val = tr_loss.item()
             sch.step(va_loss)
             tr_hist.append(tr_loss_val)
@@ -331,6 +385,7 @@ def run_setting(hidden, act_name, act_fn):
         data = from_networkx(G)
         data.x = torch.from_numpy(feats).to(device)
         data.edge_index = data.edge_index.to(device)
+        deg = degree(data.edge_index[0], N_NODES, dtype=torch.float32).to(device)
 
         # precompute heat-filtered features and targets
         A_norm = normalized_adj(data.edge_index, N_NODES, device)
@@ -357,6 +412,9 @@ def run_setting(hidden, act_name, act_fn):
         val_idx = np.random.choice(rem, VAL_COUNT, replace=False)
         grid_idx = np.setdiff1d(rem, val_idx)  # |Z| = 2 500
         lab_init = np.random.choice(grid_idx, M0, replace=False)
+        grid_idx_t = torch.tensor(grid_idx, device=device)
+        val_idx_t = torch.tensor(val_idx, device=device)
+        test_idx_t = torch.tensor(test_idx, device=device)
         y_np = y_raw.cpu().numpy()
         scaler = StandardScaler().fit(y_np[lab_init].reshape(-1, 1))
         labels_scaled = scaler.transform(y_np)
@@ -383,12 +441,8 @@ def run_setting(hidden, act_name, act_fn):
                         data.y[torch.tensor(val_idx, device=device)],
                     ).item()
                     pen = net(data.x, data.edge_index)[1]
-                    pen_grid = (
-                        pen[torch.tensor(grid_idx, device=device)]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    pen_grid_t = pen[grid_idx_t].detach()
+                    pen_grid = pen_grid_t.cpu().numpy()
                     Kgrid = pen_grid.shape[0]
                     if Kgrid > 0:
                         U, S, _ = sla.svd(
@@ -412,21 +466,33 @@ def run_setting(hidden, act_name, act_fn):
                         f"r {r_now}  k {k_now}  s {s_now}  sigma_min {sigma_min:.3e}\n"
                     )
 
-                # TODO[CAS-weights]: compute rho_Z and w from measure-scaled SVD; see plan
-                logger.info(
-                    "CAS weights skipped: rho_Z undefined; training uses unweighted MSE"
+                rho_grid = deg[grid_idx_t]
+                w_grid, _, _ = compute_christoffel_weights(pen_grid_t, rho_grid)
+                w_all = torch.zeros(N_NODES, device=device)
+                w_all[grid_idx_t] = w_grid
+                wL = w_all[torch.tensor(labels, device=device)]
+                alpha = len(labels) / wL.sum().clamp_min(1e-12)
+                w_all *= alpha
+                wL = w_all[torch.tensor(labels, device=device)]
+                w_stats = (
+                    wL.min().item(),
+                    wL.median().item(),
+                    wL.max().item(),
                 )
+                ESS = (wL.sum().item() ** 2) / wL.pow(2).sum().item()
+
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"[{EXPERIMENT}] [WARN] round {r} CAS weights skipped: "
-                        "rho_Z undefined; training uses unweighted MSE\n"
+                        f"[{EXPERIMENT}] [WT] round {r}  ESS {ESS:.1f}  "
+                        f"w_min {w_stats[0]:.3e}  w_med {w_stats[1]:.3e}  w_max {w_stats[2]:.3e}\n"
                     )
 
                 net, tr_hist, va_hist, lr_hist = train_round(
                     net,
                     data,
                     torch.tensor(labels, device=device),
-                    torch.tensor(val_idx, device=device),
+                    val_idx_t,
+                    weights=w_all,
                     base_lr=1e-2,
                     max_epochs=50_000,
                     chk=CHK,
@@ -440,10 +506,8 @@ def run_setting(hidden, act_name, act_fn):
                             f"last_val {va_hist[-1]:.6f}  last_lr {lr_hist[-1]:.5f}\n"
                         )
 
-                test_pred = net(data.x, data.edge_index)[0][
-                    torch.tensor(test_idx, device=device)
-                ]
-                test_true = data.y[torch.tensor(test_idx, device=device)]
+                test_pred = net(data.x, data.edge_index)[0][test_idx_t]
+                test_true = data.y[test_idx_t]
                 mse = torch.nn.MSELoss()(test_pred, test_true).item()
                 rell2 = (
                     torch.linalg.norm(test_pred - test_true)
