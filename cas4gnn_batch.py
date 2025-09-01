@@ -2,6 +2,7 @@
 # cas4gnn_batch.py  –  synthetic regression with CAS vs MC
 # --------------------------------------------------------
 import argparse
+import logging
 import random
 from pathlib import Path
 import numpy as np
@@ -15,6 +16,8 @@ from torch_geometric.utils import from_networkx
 from torch_geometric.nn import GCNConv
 
 from run_utils import prepare_run, write_run_config
+
+logger = logging.getLogger(__name__)
 
 
 # ---- Graph heat filtering via Chebyshev polynomials ----
@@ -263,6 +266,7 @@ def train_round(
     the specified cadence."""
 
     crit = torch.nn.MSELoss()
+    # TODO[CAS-weights]: replace with weighted MSE when weights are available
     opt = torch.optim.Adam(net.parameters(), lr=base_lr, weight_decay=5e-5)
     sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode="min", factor=0.5, patience=2, min_lr=1e-5
@@ -275,6 +279,7 @@ def train_round(
         net.train()
         opt.zero_grad()
         out, _ = net(data.x, data.edge_index)
+        # TODO[CAS-weights]: incorporate per-sample weights here
         tr_loss = crit(out[train_idx], data.y[train_idx])
         tr_loss.backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
@@ -309,7 +314,9 @@ def train_round(
 
 # ───── one config (hidden, act) over 5 seeds ─────────────
 def run_setting(hidden, act_name, act_fn):
-    cas_mses, cas_ranks, mc_mses = [], [], []
+    cas_mses, cas_ranks, cas_rell2s = [], [], []
+    mc_mses, mc_rell2s = [], []
+    base_mses = []
     history_log = {"CAS": [], "MC": []}
     for seed in SEEDS:
         torch.manual_seed(seed)
@@ -361,7 +368,7 @@ def run_setting(hidden, act_name, act_fn):
             unlab = np.setdiff1d(grid_idx, labels)
             net = GCN(data.x.size(1), hidden, 1, act_fn).to(device)
 
-            mses, ranks = [], []
+            mses, ranks, rell2s, consts = [], [], [], []
             for r in range(ROUNDS + 1):
                 # ----- PRE-ROUND LOGGING -----
                 with torch.no_grad():
@@ -405,6 +412,16 @@ def run_setting(hidden, act_name, act_fn):
                         f"r {r_now}  k {k_now}  s {s_now}  sigma_min {sigma_min:.3e}\n"
                     )
 
+                # TODO[CAS-weights]: compute rho_Z and w from measure-scaled SVD; see plan
+                logger.info(
+                    "CAS weights skipped: rho_Z undefined; training uses unweighted MSE"
+                )
+                with open(LOG_FILE, "a") as f:
+                    f.write(
+                        f"[{EXPERIMENT}] [WARN] round {r} CAS weights skipped: "
+                        "rho_Z undefined; training uses unweighted MSE\n"
+                    )
+
                 net, tr_hist, va_hist, lr_hist = train_round(
                     net,
                     data,
@@ -423,16 +440,24 @@ def run_setting(hidden, act_name, act_fn):
                             f"last_val {va_hist[-1]:.6f}  last_lr {lr_hist[-1]:.5f}\n"
                         )
 
-                mse = torch.nn.MSELoss()(
-                    net(data.x, data.edge_index)[0][
-                        torch.tensor(test_idx, device=device)
-                    ],
-                    data.y[torch.tensor(test_idx, device=device)],
+                test_pred = net(data.x, data.edge_index)[0][
+                    torch.tensor(test_idx, device=device)
+                ]
+                test_true = data.y[torch.tensor(test_idx, device=device)]
+                mse = torch.nn.MSELoss()(test_pred, test_true).item()
+                rell2 = (
+                    torch.linalg.norm(test_pred - test_true)
+                    / torch.linalg.norm(test_true)
                 ).item()
+                train_mean = data.y[torch.tensor(labels, device=device)].mean()
+                const_mse = ((test_true - train_mean) ** 2).mean().item()
                 mses.append(mse)
+                rell2s.append(rell2)
+                consts.append(const_mse)
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"[{EXPERIMENT}] {strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
+                        f"[{EXPERIMENT}] {strategy}_{act_name}_{hidden}_seed{seed}_r{r}  "
+                        f"TestMSE {mse:.4f}  RelL2 {rell2:.4f}  ConstMSE {const_mse:.4f}\n"
                     )
 
                 # SVD for sampling stats
@@ -472,6 +497,9 @@ def run_setting(hidden, act_name, act_fn):
                         "r": r_use,
                         "k": k_use,
                         "s": s_use,
+                        "mse": mse,
+                        "rell2": rell2,
+                        "const_mse": const_mse,
                     }
                 )
 
@@ -492,11 +520,14 @@ def run_setting(hidden, act_name, act_fn):
                 labels = np.concatenate([labels, new_ids])
                 unlab = np.setdiff1d(unlab, new_ids)
 
+            base_mses.append(consts)
             if strategy == "CAS":
                 cas_mses.append(mses)
                 cas_ranks.append(ranks)
+                cas_rell2s.append(rell2s)
             else:
                 mc_mses.append(mses)
+                mc_rell2s.append(rell2s)
 
     def _agg(arrs):
         L = min(len(a) for a in arrs)
@@ -505,6 +536,9 @@ def run_setting(hidden, act_name, act_fn):
 
     cas_m_mean, cas_m_std = _agg(cas_mses)
     mc_m_mean, mc_m_std = _agg(mc_mses)
+    base_m_mean, base_m_std = _agg(base_mses)
+    cas_rel_mean, cas_rel_std = _agg(cas_rell2s)
+    mc_rel_mean, mc_rel_std = _agg(mc_rell2s)
     cas_r_mean, cas_r_std = (
         _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
     )
@@ -516,17 +550,26 @@ def run_setting(hidden, act_name, act_fn):
         cas_r_std,
         mc_m_mean,
         mc_m_std,
+        base_m_mean,
+        base_m_std,
+        cas_rel_mean,
+        cas_rel_std,
+        mc_rel_mean,
+        mc_rel_std,
         history_log,
     )
 
 
 # ───── plot helper ────────────────────────────────────────
-def plot_group(depth, dct, ylabel, fname):
+def plot_group(depth, dct, ylabel, fname, shade=True):
     plt.figure(figsize=(6, 4))
     for lab, (m, s) in dct.items():
         x = np.arange(len(m)) * INC + M0
         plt.plot(x, m, label=lab, lw=2)
-        plt.fill_between(x, m - s, m + s, alpha=0.25)
+        if shade:
+            plt.fill_between(x, m - s, m + s, alpha=0.25)
+        # else:
+        #     plt.fill_between(x, m - s, m + s, alpha=0.25)
     if ylabel == "Test MSE":
         plt.yscale("log")
     plt.xlabel("Labeled samples")
@@ -540,6 +583,7 @@ def plot_group(depth, dct, ylabel, fname):
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = apply_schedule(parser.parse_args())
     if args.smoke:
         args.depths = [2]
@@ -576,7 +620,7 @@ if __name__ == "__main__":
     acts = {k: ACTS[k] for k in args.acts}
     for depth in args.depths:
         width_list = WIDTHS[depth]
-        mse_dict, rank_dict = {}, {}
+        mse_dict, rank_dict, rell2_dict = {}, {}, {}
         for widths in width_list:
             for act_name, act_fn in acts.items():
                 tag = (
@@ -585,15 +629,44 @@ if __name__ == "__main__":
                     else f"{widths[1]}_{act_name}"
                 )
                 print(f"[{depth}-layer] {widths}  act={act_name}")
-                cas_m, cas_s, r_m, r_s, mc_m, mc_s, _ = run_setting(
-                    widths, act_name, act_fn
-                )
+                (
+                    cas_m,
+                    cas_s,
+                    r_m,
+                    r_s,
+                    mc_m,
+                    mc_s,
+                    base_m,
+                    base_s,
+                    cas_rel_m,
+                    cas_rel_s,
+                    mc_rel_m,
+                    mc_rel_s,
+                    _,
+                ) = run_setting(widths, act_name, act_fn)
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
                 mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
+                mse_dict[f"{tag}_Const"] = (base_m, base_s)
                 rank_dict[f"{tag}_CAS"] = (r_m, r_s)
+                rell2_dict[f"{tag}_CAS"] = (cas_rel_m, cas_rel_s)
+                rell2_dict[f"{tag}_MC"] = (mc_rel_m, mc_rel_s)
         plot_group(
-            depth, mse_dict, "Test MSE", RUN_DIR / f"mse_vs_samples_{depth}layer.png"
+            depth,
+            mse_dict,
+            "Test MSE",
+            RUN_DIR / f"mse_vs_samples_{depth}layer.png",
+            shade=False,
         )
         plot_group(
-            depth, rank_dict, "Numerical rank r", RUN_DIR / f"rank_vs_samples_{depth}layer.png"
+            depth,
+            rell2_dict,
+            "RelL2",
+            RUN_DIR / f"rell2_vs_samples_{depth}layer.png",
+            shade=False,
+        )
+        plot_group(
+            depth,
+            rank_dict,
+            "Numerical rank r",
+            RUN_DIR / f"rank_vs_samples_{depth}layer.png",
         )
