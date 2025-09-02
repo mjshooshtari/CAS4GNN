@@ -310,6 +310,7 @@ def train_round(
 # ───── one config (hidden, act) over 5 seeds ─────────────
 def run_setting(hidden, act_name, act_fn):
     cas_mses, cas_ranks, mc_mses = [], [], []
+    cas_rels, mc_rels, baseline_mses = [], [], []
     history_log = {"CAS": [], "MC": []}
     for seed in SEEDS:
         torch.manual_seed(seed)
@@ -361,7 +362,7 @@ def run_setting(hidden, act_name, act_fn):
             unlab = np.setdiff1d(grid_idx, labels)
             net = GCN(data.x.size(1), hidden, 1, act_fn).to(device)
 
-            mses, ranks = [], []
+            mses, rell2s, baseline_curve, ranks = [], [], [], []
             for r in range(ROUNDS + 1):
                 # ----- PRE-ROUND LOGGING -----
                 with torch.no_grad():
@@ -423,16 +424,22 @@ def run_setting(hidden, act_name, act_fn):
                             f"last_val {va_hist[-1]:.6f}  last_lr {lr_hist[-1]:.5f}\n"
                         )
 
-                mse = torch.nn.MSELoss()(
-                    net(data.x, data.edge_index)[0][
-                        torch.tensor(test_idx, device=device)
-                    ],
-                    data.y[torch.tensor(test_idx, device=device)],
-                ).item()
+                out_t = net(data.x, data.edge_index)[0][
+                    torch.tensor(test_idx, device=device)
+                ]
+                y_t = data.y[torch.tensor(test_idx, device=device)]
+                mse = torch.nn.functional.mse_loss(out_t, y_t).item()
+                rel = (torch.norm(out_t - y_t) / torch.norm(y_t)).item()
+                baseline_pred = data.y[torch.tensor(labels, device=device)].mean()
+                const_mse = torch.mean((baseline_pred - y_t) ** 2).item()
                 mses.append(mse)
+                rell2s.append(rel)
+                baseline_curve.append(const_mse)
                 with open(LOG_FILE, "a") as f:
                     f.write(
-                        f"[{EXPERIMENT}] {strategy}_{act_name}_{hidden}_seed{seed}_r{r}  TestMSE {mse:.4f}\n"
+                        f"[{EXPERIMENT}] {strategy}_{act_name}_{hidden}_seed{seed}_r{r}  "
+                        f"MSE_test {mse:.4f}  RelL2_test {rel:.4f}  "
+                        f"const_baseline_mse_test {const_mse:.4f}\n"
                     )
 
                 # SVD for sampling stats
@@ -495,8 +502,11 @@ def run_setting(hidden, act_name, act_fn):
             if strategy == "CAS":
                 cas_mses.append(mses)
                 cas_ranks.append(ranks)
+                cas_rels.append(rell2s)
             else:
                 mc_mses.append(mses)
+                mc_rels.append(rell2s)
+            baseline_mses.append(baseline_curve)
 
     def _agg(arrs):
         L = min(len(a) for a in arrs)
@@ -505,10 +515,20 @@ def run_setting(hidden, act_name, act_fn):
 
     cas_m_mean, cas_m_std = _agg(cas_mses)
     mc_m_mean, mc_m_std = _agg(mc_mses)
+    baseline_m_mean, baseline_m_std = _agg(baseline_mses)
+    cas_rel_mean, _ = _agg(cas_rels)
+    mc_rel_mean, _ = _agg(mc_rels)
     cas_r_mean, cas_r_std = (
         _agg(cas_ranks) if cas_ranks else (np.array([]), np.array([]))
     )
 
+    extra = {
+        "history_log": history_log,
+        "baseline_m_mean": baseline_m_mean,
+        "baseline_m_std": baseline_m_std,
+        "cas_rel_mean": cas_rel_mean,
+        "mc_rel_mean": mc_rel_mean,
+    }
     return (
         cas_m_mean,
         cas_m_std,
@@ -516,17 +536,19 @@ def run_setting(hidden, act_name, act_fn):
         cas_r_std,
         mc_m_mean,
         mc_m_std,
-        history_log,
+        extra,
     )
 
 
 # ───── plot helper ────────────────────────────────────────
-def plot_group(depth, dct, ylabel, fname):
+def plot_group(depth, dct, ylabel, fname, fill=True):
     plt.figure(figsize=(6, 4))
     for lab, (m, s) in dct.items():
         x = np.arange(len(m)) * INC + M0
         plt.plot(x, m, label=lab, lw=2)
-        plt.fill_between(x, m - s, m + s, alpha=0.25)
+        # plt.fill_between(x, m - s, m + s, alpha=0.25)
+        if fill:
+            plt.fill_between(x, m - s, m + s, alpha=0.25)
     if ylabel == "Test MSE":
         plt.yscale("log")
     plt.xlabel("Labeled samples")
@@ -576,7 +598,7 @@ if __name__ == "__main__":
     acts = {k: ACTS[k] for k in args.acts}
     for depth in args.depths:
         width_list = WIDTHS[depth]
-        mse_dict, rank_dict = {}, {}
+        mse_dict, rank_dict, rell2_dict = {}, {}, {}
         for widths in width_list:
             for act_name, act_fn in acts.items():
                 tag = (
@@ -585,15 +607,42 @@ if __name__ == "__main__":
                     else f"{widths[1]}_{act_name}"
                 )
                 print(f"[{depth}-layer] {widths}  act={act_name}")
-                cas_m, cas_s, r_m, r_s, mc_m, mc_s, _ = run_setting(
-                    widths, act_name, act_fn
-                )
+                (
+                    cas_m,
+                    cas_s,
+                    r_m,
+                    r_s,
+                    mc_m,
+                    mc_s,
+                    extra,
+                ) = run_setting(widths, act_name, act_fn)
+                base_m = extra["baseline_m_mean"]
+                base_s = extra["baseline_m_std"]
+                cas_rel = extra["cas_rel_mean"]
+                mc_rel = extra["mc_rel_mean"]
                 mse_dict[f"{tag}_CAS"] = (cas_m, cas_s)
                 mse_dict[f"{tag}_MC"] = (mc_m, mc_s)
+                mse_dict[f"{tag}_Const"] = (base_m, base_s)
+                rell2_dict[f"{tag}_CAS"] = (cas_rel, np.zeros_like(cas_rel))
+                rell2_dict[f"{tag}_MC"] = (mc_rel, np.zeros_like(mc_rel))
                 rank_dict[f"{tag}_CAS"] = (r_m, r_s)
         plot_group(
-            depth, mse_dict, "Test MSE", RUN_DIR / f"mse_vs_samples_{depth}layer.png"
+            depth,
+            mse_dict,
+            "Test MSE",
+            RUN_DIR / f"mse_vs_samples_{depth}layer.png",
+            fill=False,
         )
         plot_group(
-            depth, rank_dict, "Numerical rank r", RUN_DIR / f"rank_vs_samples_{depth}layer.png"
+            depth,
+            rell2_dict,
+            "RelL2",
+            RUN_DIR / f"rell2_vs_samples_{depth}layer.png",
+            fill=False,
+        )
+        plot_group(
+            depth,
+            rank_dict,
+            "Numerical rank r",
+            RUN_DIR / f"rank_vs_samples_{depth}layer.png",
         )
